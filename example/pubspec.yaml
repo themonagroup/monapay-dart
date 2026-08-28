@@ -1,0 +1,12 @@
+name: monapay_flutter_example
+description: Flutter QR widget example for the MONA Pay Dart SDK.
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  monapay:
+    path: ..
