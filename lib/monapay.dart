@@ -5,7 +5,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-const String monaPayVersion = '0.1.0';
+const String monaPayVersion = '0.3.0';
 const String monaPayDefaultBaseUrl = 'https://api.monapay.vn';
 
 class MonaPayException implements Exception {
@@ -16,7 +16,8 @@ class MonaPayException implements Exception {
   final Object? body;
 
   @override
-  String toString() => 'MonaPayException${status == null ? '' : ' ($status)'}: $message';
+  String toString() =>
+      'MonaPayException${status == null ? '' : ' ($status)'}: $message';
 }
 
 class MonaPayHttpRequest {
@@ -40,26 +41,44 @@ class MonaPayHttpResponse {
   final String body;
 }
 
-typedef MonaPayTransport = Future<MonaPayHttpResponse> Function(MonaPayHttpRequest request);
+typedef MonaPayTransport = Future<MonaPayHttpResponse> Function(
+  MonaPayHttpRequest request,
+);
 
 class MonaPayClient {
   MonaPayClient({
-    required String username,
-    required String password,
+    String? clientId,
+    String? username,
+    String? password,
     String? clientSecret,
     String baseUrl = monaPayDefaultBaseUrl,
     MonaPayTransport? transport,
     HttpClient? httpClient,
-  })  : _username = username,
-        _password = password,
-        _clientSecret = clientSecret ?? '',
-        baseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), ''),
-        _httpClient = httpClient ?? HttpClient() {
-    if (_username.trim().isEmpty) throw ArgumentError.value(username, 'username', 'là bắt buộc');
-    if (_password.isEmpty) throw ArgumentError.value(password, 'password', 'là bắt buộc');
+  }) : _clientId = clientId ?? '',
+       _username = username ?? '',
+       _password = password ?? '',
+       _clientSecret = clientSecret ?? '',
+       baseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), ''),
+       _httpClient = httpClient ?? HttpClient() {
+    final hasClientCredentials =
+        _clientId.trim().isNotEmpty && _clientSecret.trim().isNotEmpty;
+    final hasPasswordCredentials =
+        _username.trim().isNotEmpty && _password.isNotEmpty;
+    if (!hasClientCredentials && !hasPasswordCredentials) {
+      throw ArgumentError(
+        'Cần clientId + clientSecret hoặc username + password; không dùng password cho AI agent vì sẽ gãy khi bật 2FA',
+      );
+    }
     final parsed = Uri.tryParse(this.baseUrl);
-    if (parsed == null || !parsed.hasScheme || !parsed.hasAuthority || !const ['http', 'https'].contains(parsed.scheme)) {
-      throw ArgumentError.value(baseUrl, 'baseUrl', 'phải là URL http/https hợp lệ');
+    if (parsed == null ||
+        !parsed.hasScheme ||
+        !parsed.hasAuthority ||
+        !const ['http', 'https'].contains(parsed.scheme)) {
+      throw ArgumentError.value(
+        baseUrl,
+        'baseUrl',
+        'phải là URL http/https hợp lệ',
+      );
     }
     _transport = transport ?? _sendHttp;
     keys = KeysResource(this);
@@ -69,8 +88,30 @@ class MonaPayClient {
     transactions = TransactionsResource(this);
     webhooks = WebhooksResource(this);
     webhookLogs = WebhookLogsResource(this);
+    sandbox = SandboxResource(this);
+    emailConfigs = EmailConfigsResource(this);
+    emailLogs = EmailLogsResource(this);
+    emailSuppressions = EmailSuppressionsResource(this);
   }
 
+  factory MonaPayClient.fromEnv({
+    Map<String, String>? environment,
+    MonaPayTransport? transport,
+    HttpClient? httpClient,
+  }) {
+    final values = environment ?? Platform.environment;
+    return MonaPayClient(
+      clientId: values['MONAPAY_CLIENT_ID'],
+      clientSecret: values['MONAPAY_CLIENT_SECRET'],
+      username: values['MONAPAY_USERNAME'],
+      password: values['MONAPAY_PASSWORD'],
+      baseUrl: values['MONAPAY_BASE_URL'] ?? monaPayDefaultBaseUrl,
+      transport: transport,
+      httpClient: httpClient,
+    );
+  }
+
+  final String _clientId;
   final String _username;
   final String _password;
   final HttpClient _httpClient;
@@ -78,6 +119,10 @@ class MonaPayClient {
   late final MonaPayTransport _transport;
   String _clientSecret;
   String? _accessToken;
+  DateTime _tokenExpiresAt = DateTime.fromMillisecondsSinceEpoch(
+    0,
+    isUtc: true,
+  );
   Future<String>? _loginInFlight;
 
   late final KeysResource keys;
@@ -87,10 +132,17 @@ class MonaPayClient {
   late final TransactionsResource transactions;
   late final WebhooksResource webhooks;
   late final WebhookLogsResource webhookLogs;
+  late final SandboxResource sandbox;
+  late final EmailConfigsResource emailConfigs;
+  late final EmailLogsResource emailLogs;
+  late final EmailSuppressionsResource emailSuppressions;
 
   Future<String> login() async {
     final cached = _accessToken;
-    if (cached != null && cached.isNotEmpty) return cached;
+    if (cached != null &&
+        cached.isNotEmpty &&
+        DateTime.now().toUtc().isBefore(_tokenExpiresAt))
+      return cached;
     final active = _loginInFlight;
     if (active != null) return active;
 
@@ -104,17 +156,38 @@ class MonaPayClient {
   }
 
   Future<String> _performLogin() async {
+    final usingClientCredentials =
+        _clientId.isNotEmpty && _clientSecret.isNotEmpty;
     final data = await _send(
       'POST',
-      '/api/v1/client/login',
-      body: {'username': _username, 'password': _password},
+      usingClientCredentials ? '/api/v1/oauth/token' : '/api/v1/client/login',
+      body: usingClientCredentials
+          ? {
+              'grant_type': 'client_credentials',
+              'client_id': _clientId,
+              'client_secret': _clientSecret,
+            }
+          : {'username': _username, 'password': _password},
       authenticated: false,
     );
     final token = data is Map ? data['access_token']?.toString() : null;
     if (token == null || token.isEmpty) {
-      throw MonaPayException('Response đăng nhập không có access_token', body: data);
+      throw MonaPayException(
+        'Response đăng nhập không có access_token',
+        body: data,
+      );
     }
     _accessToken = token;
+    final rawExpires = data is Map ? data['expires_in'] : null;
+    final expiresIn = rawExpires is num
+        ? rawExpires.toDouble()
+        : (usingClientCredentials ? 3600.0 : 86400.0);
+    _tokenExpiresAt = DateTime.now().toUtc().add(
+      Duration(
+        milliseconds: ((expiresIn - 60).clamp(0, double.infinity) * 1000)
+            .round(),
+      ),
+    );
     return token;
   }
 
@@ -131,7 +204,10 @@ class MonaPayClient {
       return await _send(method, path, body: body, query: query, token: token);
     } on MonaPayException catch (error) {
       if (error.status != 401) rethrow;
-      if (_accessToken == token) _accessToken = null;
+      if (_accessToken == token) {
+        _accessToken = null;
+        _tokenExpiresAt = DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+      }
       final refreshed = await login();
       return _send(method, path, body: body, query: query, token: refreshed);
     }
@@ -155,22 +231,35 @@ class MonaPayClient {
     final encoded = body == null ? null : jsonEncode(body);
     final headers = <String, String>{'Accept': 'application/json'};
     if (encoded != null) headers['Content-Type'] = 'application/json';
-    if (authenticated && token != null && token.isNotEmpty) headers['Authorization'] = 'Bearer $token';
+    if (authenticated && token != null && token.isNotEmpty)
+      headers['Authorization'] = 'Bearer $token';
     if (authenticated && method != 'GET' && _clientSecret.isNotEmpty) {
       headers['X-Client-Secret'] = _clientSecret;
     }
 
     MonaPayHttpResponse response;
     try {
-      response = await _transport(MonaPayHttpRequest(method: method, url: uri, headers: headers, body: encoded));
+      response = await _transport(
+        MonaPayHttpRequest(
+          method: method,
+          url: uri,
+          headers: headers,
+          body: encoded,
+        ),
+      );
     } catch (error) {
       if (error is MonaPayException) rethrow;
-      throw MonaPayException('Không kết nối được MONA Pay: $error', body: error);
+      throw MonaPayException(
+        'Không kết nối được MONA Pay: $error',
+        body: error,
+      );
     }
 
     dynamic envelope;
     try {
-      envelope = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+      envelope = response.body.isEmpty
+          ? <String, dynamic>{}
+          : jsonDecode(response.body);
     } on FormatException {
       throw MonaPayException(
         'MONA Pay trả response không phải JSON (HTTP ${response.status})',
@@ -180,9 +269,13 @@ class MonaPayClient {
     }
     final failedEnvelope = envelope is Map && envelope['success'] == false;
     if (response.status < 200 || response.status >= 300 || failedEnvelope) {
-      final message = envelope is Map ? (envelope['message'] ?? envelope['detail'])?.toString() : null;
+      final message = envelope is Map
+          ? (envelope['message'] ?? envelope['detail'])?.toString()
+          : null;
       throw MonaPayException(
-        message == null || message.isEmpty ? 'MONA Pay API lỗi HTTP ${response.status}' : message,
+        message == null || message.isEmpty
+            ? 'MONA Pay API lỗi HTTP ${response.status}'
+            : message,
         status: response.status,
         body: envelope,
       );
@@ -220,8 +313,14 @@ class KeysResource extends _Resource {
   const KeysResource(super.client);
 
   Future<dynamic> generate([String name = 'Default Key']) async {
-    final data = await client.request('POST', '/api/v1/client-keys/generate', body: {'name': name});
-    if (data is Map && data['client_secret'] != null && data['client_secret'].toString().isNotEmpty) {
+    final data = await client.request(
+      'POST',
+      '/api/v1/client-keys/generate',
+      body: {'name': name},
+    );
+    if (data is Map &&
+        data['client_secret'] != null &&
+        data['client_secret'].toString().isNotEmpty) {
       client.useClientSecret(data['client_secret'].toString());
     }
     return data;
@@ -236,32 +335,45 @@ class KeysResource extends _Resource {
 class VirtualAccountsResource extends _Resource {
   const VirtualAccountsResource(super.client);
 
-  Future<dynamic> register(Map<String, dynamic> body) =>
-      client.request('POST', '/api/v1/acb/virtual-account/registration', body: body);
+  Future<dynamic> register(Map<String, dynamic> body) => client.request(
+    'POST',
+    '/api/v1/acb/virtual-account/registration',
+    body: body,
+  );
 
   Future<dynamic> verify(String requestId, String code) => client.request(
-        'POST',
-        '/api/v1/acb/${segment(requestId)}/virtual-account/verification',
-        body: {'code': code},
-      );
+    'POST',
+    '/api/v1/acb/${segment(requestId)}/virtual-account/verification',
+    body: {'code': code},
+  );
 
-  Future<dynamic> registerNotification(String virtualAccountId, [Map<String, dynamic> body = const {}]) =>
-      client.request('POST', '/api/v1/acb/${segment(virtualAccountId)}/notification/registration', body: body);
+  Future<dynamic> registerNotification(
+    String virtualAccountId, [
+    Map<String, dynamic> body = const {},
+  ]) => client.request(
+    'POST',
+    '/api/v1/acb/${segment(virtualAccountId)}/notification/registration',
+    body: body,
+  );
 
-  Future<dynamic> verifyNotification(String requestId, String code) => client.request(
+  Future<dynamic> verifyNotification(String requestId, String code) =>
+      client.request(
         'POST',
         '/api/v1/acb/${segment(requestId)}/notification/verification',
         body: {'code': code},
       );
 
-  Future<dynamic> list(String bankAccountId) =>
-      client.request('GET', '/api/v1/acb/${segment(bankAccountId)}/virtual-account/retrieve');
+  Future<dynamic> list(String bankAccountId) => client.request(
+    'GET',
+    '/api/v1/acb/${segment(bankAccountId)}/virtual-account/retrieve',
+  );
 }
 
 class BankAccountsResource extends _Resource {
   const BankAccountsResource(super.client);
 
-  Future<dynamic> list() => client.request('GET', '/api/v1/client/bank-accounts');
+  Future<dynamic> list() =>
+      client.request('GET', '/api/v1/client/bank-accounts');
 }
 
 class QrResource extends _Resource {
@@ -271,14 +383,23 @@ class QrResource extends _Resource {
       client.request('POST', '/api/v1/acb/qr-payment/generate', body: body);
 
   Future<dynamic> cancel(String qrCodeId, [Map<String, dynamic>? body]) =>
-      client.request('DELETE', '/api/v1/acb/qr-payment/${segment(qrCodeId)}/cancellation', body: body);
+      client.request(
+        'DELETE',
+        '/api/v1/acb/qr-payment/${segment(qrCodeId)}/cancellation',
+        body: body,
+      );
 }
 
 class TransactionsResource extends _Resource {
   const TransactionsResource(super.client);
 
-  Future<dynamic> list({required String virtualAccountNumber, int page = 1, int limit = 100}) {
-    if (virtualAccountNumber.isEmpty) throw ArgumentError('virtualAccountNumber là bắt buộc');
+  Future<dynamic> list({
+    required String virtualAccountNumber,
+    int page = 1,
+    int limit = 100,
+  }) {
+    if (virtualAccountNumber.isEmpty)
+      throw ArgumentError('virtualAccountNumber là bắt buộc');
     return client.request(
       'GET',
       '/api/v1/acb/virtual-account/transactions',
@@ -300,13 +421,23 @@ class TransactionsResource extends _Resource {
     final pageSize = limit > 0 ? limit : 100;
     var stopped = false;
     while (!stopped) {
-      final response = await list(virtualAccountNumber: virtualAccountNumber, page: currentPage, limit: pageSize);
-      if (response is! Map) throw MonaPayException('Response giao dịch không phải object', body: response);
+      final response = await list(
+        virtualAccountNumber: virtualAccountNumber,
+        page: currentPage,
+        limit: pageSize,
+      );
+      if (response is! Map)
+        throw MonaPayException(
+          'Response giao dịch không phải object',
+          body: response,
+        );
       final items = response['data'];
       if (items is List) {
         for (final item in items) {
-          if (sinceId != null && item is Map &&
-              (item['id']?.toString() == sinceId || item['transaction_code']?.toString() == sinceId)) {
+          if (sinceId != null &&
+              item is Map &&
+              (item['id']?.toString() == sinceId ||
+                  item['transaction_code']?.toString() == sinceId)) {
             stopped = true;
             break;
           }
@@ -322,7 +453,11 @@ class TransactionsResource extends _Resource {
     }
   }
 
-  Future<dynamic> retry(String transactionId, {required String targetType, String? targetId}) {
+  Future<dynamic> retry(
+    String transactionId, {
+    required String targetType,
+    String? targetId,
+  }) {
     final body = <String, dynamic>{'target_type': targetType};
     if (targetId != null && targetId.isNotEmpty) body['target_id'] = targetId;
     return client.request(
@@ -332,7 +467,8 @@ class TransactionsResource extends _Resource {
     );
   }
 
-  static int _toInt(dynamic value, int fallback) => int.tryParse(value?.toString() ?? '') ?? fallback;
+  static int _toInt(dynamic value, int fallback) =>
+      int.tryParse(value?.toString() ?? '') ?? fallback;
 }
 
 class WebhooksResource extends _Resource {
@@ -344,37 +480,149 @@ class WebhooksResource extends _Resource {
       client.request('POST', '/api/v1/client-webhooks', body: body);
 
   Future<dynamic> update(String configId, Map<String, dynamic> body) =>
-      client.request('PUT', '/api/v1/client-webhooks/${segment(configId)}', body: body);
+      client.request(
+        'PUT',
+        '/api/v1/client-webhooks/${segment(configId)}',
+        body: body,
+      );
 
   Future<dynamic> remove(String configId) =>
       client.request('DELETE', '/api/v1/client-webhooks/${segment(configId)}');
 
-  Future<dynamic> test([Map<String, dynamic> body = const {'is_dummy': true}]) =>
-      client.request('POST', '/api/v1/client-webhooks/test', body: body);
+  Future<dynamic> test([
+    Map<String, dynamic> body = const {'is_dummy': true},
+  ]) => client.request('POST', '/api/v1/client-webhooks/test', body: body);
 }
 
 class WebhookLogsResource extends _Resource {
   const WebhookLogsResource(super.client);
 
-  Future<dynamic> list({String? status, String? fromDate, String? toDate, int? page, int? limit}) => client.request(
-        'GET',
-        '/api/v1/webhook-logs',
-        query: _query(status, fromDate, toDate, page, limit),
-      );
+  Future<dynamic> list({
+    String? status,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  }) => client.request(
+    'GET',
+    '/api/v1/webhook-logs',
+    query: _query(status, fromDate, toDate, page, limit),
+  );
 
-  Future<dynamic> stats({String? status, String? fromDate, String? toDate, int? page, int? limit}) => client.request(
-        'GET',
-        '/api/v1/webhook-logs/stats',
-        query: _query(status, fromDate, toDate, page, limit),
-      );
+  Future<dynamic> stats({
+    String? status,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  }) => client.request(
+    'GET',
+    '/api/v1/webhook-logs/stats',
+    query: _query(status, fromDate, toDate, page, limit),
+  );
 
-  static Map<String, String?> _query(String? status, String? fromDate, String? toDate, int? page, int? limit) => {
-        'status': status,
-        'from_date': fromDate,
-        'to_date': toDate,
-        'page': page?.toString(),
-        'limit': limit?.toString(),
-      };
+  static Map<String, String?> _query(
+    String? status,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  ) => {
+    'status': status,
+    'from_date': fromDate,
+    'to_date': toDate,
+    'page': page?.toString(),
+    'limit': limit?.toString(),
+  };
+}
+
+class SandboxResource extends _Resource {
+  const SandboxResource(super.client);
+
+  Future<dynamic> createTransaction(Map<String, dynamic> body) =>
+      client.request('POST', '/api/v1/sandbox/transactions', body: body);
+}
+
+class EmailConfigsResource extends _Resource {
+  const EmailConfigsResource(super.client);
+
+  Future<dynamic> list() => client.request('GET', '/api/v1/email-configs');
+  Future<dynamic> create(Map<String, dynamic> body) =>
+      client.request('POST', '/api/v1/email-configs', body: body);
+  Future<dynamic> get(String configId) =>
+      client.request('GET', '/api/v1/email-configs/${segment(configId)}');
+  Future<dynamic> update(String configId, Map<String, dynamic> body) => client
+      .request('PUT', '/api/v1/email-configs/${segment(configId)}', body: body);
+  Future<dynamic> remove(String configId) =>
+      client.request('DELETE', '/api/v1/email-configs/${segment(configId)}');
+  Future<dynamic> verify(
+    String configId, {
+    required String email,
+    required String code,
+  }) => client.request(
+    'POST',
+    '/api/v1/email-configs/${segment(configId)}/verify',
+    body: {'email': email, 'code': code},
+  );
+  Future<dynamic> resendVerification(String configId, String email) =>
+      client.request(
+        'POST',
+        '/api/v1/email-configs/${segment(configId)}/resend-verification',
+        body: {'email': email},
+      );
+  Future<dynamic> test(String configId) => client.request(
+    'POST',
+    '/api/v1/email-configs/${segment(configId)}/test',
+    body: const <String, dynamic>{},
+  );
+}
+
+class EmailLogsResource extends _Resource {
+  const EmailLogsResource(super.client);
+
+  Future<dynamic> list({
+    String? configId,
+    String? status,
+    String? eventType,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  }) => client.request(
+    'GET',
+    '/api/v1/email-logs',
+    query: _query(configId, status, eventType, fromDate, toDate, page, limit),
+  );
+  Future<dynamic> stats({String? fromDate, String? toDate}) => client.request(
+    'GET',
+    '/api/v1/email-logs/stats',
+    query: _query(null, null, null, fromDate, toDate, null, null),
+  );
+  static Map<String, String?> _query(
+    String? configId,
+    String? status,
+    String? eventType,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  ) => {
+    'config_id': configId,
+    'status': status,
+    'event_type': eventType,
+    'from_date': fromDate,
+    'to_date': toDate,
+    'page': page?.toString(),
+    'limit': limit?.toString(),
+  };
+}
+
+class EmailSuppressionsResource extends _Resource {
+  const EmailSuppressionsResource(super.client);
+
+  Future<dynamic> list() => client.request('GET', '/api/v1/email-suppressions');
+  Future<dynamic> remove(String email) =>
+      client.request('DELETE', '/api/v1/email-suppressions/${segment(email)}');
 }
 
 class WebhookResult {
@@ -395,23 +643,35 @@ WebhookResult verifyWebhook(
   String secret, {
   int tolerance = 300,
 }) {
-  if (tolerance < 0) throw ArgumentError.value(tolerance, 'tolerance', 'phải là số không âm');
-  if (timestamp.isEmpty) return const WebhookResult.invalid('missing_timestamp');
-  if (!RegExp(r'^\d+$').hasMatch(timestamp)) return const WebhookResult.invalid('invalid_timestamp');
+  if (tolerance < 0)
+    throw ArgumentError.value(tolerance, 'tolerance', 'phải là số không âm');
+  if (timestamp.isEmpty)
+    return const WebhookResult.invalid('missing_timestamp');
+  if (!RegExp(r'^\d+$').hasMatch(timestamp))
+    return const WebhookResult.invalid('invalid_timestamp');
   final unix = int.tryParse(timestamp);
   if (unix == null) return const WebhookResult.invalid('invalid_timestamp');
   final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-  if ((now - unix).abs() > tolerance) return const WebhookResult.invalid('timestamp_out_of_tolerance');
-  if (signature.isEmpty) return const WebhookResult.invalid('missing_signature');
+  if ((now - unix).abs() > tolerance)
+    return const WebhookResult.invalid('timestamp_out_of_tolerance');
+  if (signature.isEmpty)
+    return const WebhookResult.invalid('missing_signature');
 
-  final expected = _hmacSha256(utf8.encode(secret), <int>[...utf8.encode('$timestamp.'), ...raw]);
+  final expected = _hmacSha256(utf8.encode(secret), <int>[
+    ...utf8.encode('$timestamp.'),
+    ...raw,
+  ]);
   final validFormat = RegExp(r'^sha256=[0-9a-fA-F]{64}$').hasMatch(signature);
-  final supplied = validFormat ? _decodeHex(signature.substring(7)) : Uint8List(32);
+  final supplied = validFormat
+      ? _decodeHex(signature.substring(7))
+      : Uint8List(32);
   if (!_constantTimeEquals(expected, supplied) || !validFormat) {
     return const WebhookResult.invalid('invalid_signature');
   }
   try {
-    return WebhookResult.valid(jsonDecode(utf8.decode(raw, allowMalformed: false)));
+    return WebhookResult.valid(
+      jsonDecode(utf8.decode(raw, allowMalformed: false)),
+    );
   } on FormatException {
     return const WebhookResult.invalid('invalid_json');
   }
@@ -421,22 +681,82 @@ Uint8List _hmacSha256(List<int> key, List<int> message) {
   var normalized = Uint8List.fromList(key);
   if (normalized.length > 64) normalized = _sha256(normalized);
   final padded = Uint8List(64)..setRange(0, normalized.length, normalized);
-  final innerPad = Uint8List.fromList(padded.map((byte) => byte ^ 0x36).toList());
-  final outerPad = Uint8List.fromList(padded.map((byte) => byte ^ 0x5c).toList());
+  final innerPad = Uint8List.fromList(
+    padded.map((byte) => byte ^ 0x36).toList(),
+  );
+  final outerPad = Uint8List.fromList(
+    padded.map((byte) => byte ^ 0x5c).toList(),
+  );
   final inner = _sha256(Uint8List.fromList(<int>[...innerPad, ...message]));
   return _sha256(Uint8List.fromList(<int>[...outerPad, ...inner]));
 }
 
 Uint8List _sha256(List<int> input) {
   const constants = <int>[
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a2f98,
+    0x71374491,
+    0xb5c0fbcf,
+    0xe9b5dba5,
+    0x3956c25b,
+    0x59f111f1,
+    0x923f82a4,
+    0xab1c5ed5,
+    0xd807aa98,
+    0x12835b01,
+    0x243185be,
+    0x550c7dc3,
+    0x72be5d74,
+    0x80deb1fe,
+    0x9bdc06a7,
+    0xc19bf174,
+    0xe49b69c1,
+    0xefbe4786,
+    0x0fc19dc6,
+    0x240ca1cc,
+    0x2de92c6f,
+    0x4a7484aa,
+    0x5cb0a9dc,
+    0x76f988da,
+    0x983e5152,
+    0xa831c66d,
+    0xb00327c8,
+    0xbf597fc7,
+    0xc6e00bf3,
+    0xd5a79147,
+    0x06ca6351,
+    0x14292967,
+    0x27b70a85,
+    0x2e1b2138,
+    0x4d2c6dfc,
+    0x53380d13,
+    0x650a7354,
+    0x766a0abb,
+    0x81c2c92e,
+    0x92722c85,
+    0xa2bfe8a1,
+    0xa81a664b,
+    0xc24b8b70,
+    0xc76c51a3,
+    0xd192e819,
+    0xd6990624,
+    0xf40e3585,
+    0x106aa070,
+    0x19a4c116,
+    0x1e376c08,
+    0x2748774c,
+    0x34b0bcb5,
+    0x391c0cb3,
+    0x4ed8aa4a,
+    0x5b9cca4f,
+    0x682e6ff3,
+    0x748f82ee,
+    0x78a5636f,
+    0x84c87814,
+    0x8cc70208,
+    0x90befffa,
+    0xa4506ceb,
+    0xbef9a3f7,
+    0xc67178f2,
   ];
   final bytes = <int>[...input];
   final bitLength = bytes.length * 8;
@@ -458,11 +778,21 @@ Uint8List _sha256(List<int> input) {
     final words = Uint32List(64);
     for (var i = 0; i < 16; i++) {
       final at = offset + i * 4;
-      words[i] = (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3];
+      words[i] =
+          (bytes[at] << 24) |
+          (bytes[at + 1] << 16) |
+          (bytes[at + 2] << 8) |
+          bytes[at + 3];
     }
     for (var i = 16; i < 64; i++) {
-      final s0 = _rotateRight(words[i - 15], 7) ^ _rotateRight(words[i - 15], 18) ^ (words[i - 15] >> 3);
-      final s1 = _rotateRight(words[i - 2], 17) ^ _rotateRight(words[i - 2], 19) ^ (words[i - 2] >> 10);
+      final s0 =
+          _rotateRight(words[i - 15], 7) ^
+          _rotateRight(words[i - 15], 18) ^
+          (words[i - 15] >> 3);
+      final s1 =
+          _rotateRight(words[i - 2], 17) ^
+          _rotateRight(words[i - 2], 19) ^
+          (words[i - 2] >> 10);
       words[i] = (words[i - 16] + s0 + words[i - 7] + s1) & 0xffffffff;
     }
     var a = h0;
@@ -474,10 +804,12 @@ Uint8List _sha256(List<int> input) {
     var g = h6;
     var h = h7;
     for (var i = 0; i < 64; i++) {
-      final sum1 = _rotateRight(e, 6) ^ _rotateRight(e, 11) ^ _rotateRight(e, 25);
+      final sum1 =
+          _rotateRight(e, 6) ^ _rotateRight(e, 11) ^ _rotateRight(e, 25);
       final choice = (e & f) ^ ((~e) & g);
       final temp1 = (h + sum1 + choice + constants[i] + words[i]) & 0xffffffff;
-      final sum0 = _rotateRight(a, 2) ^ _rotateRight(a, 13) ^ _rotateRight(a, 22);
+      final sum0 =
+          _rotateRight(a, 2) ^ _rotateRight(a, 13) ^ _rotateRight(a, 22);
       final majority = (a & b) ^ (a & c) ^ (b & c);
       final temp2 = (sum0 + majority) & 0xffffffff;
       h = g;
@@ -500,8 +832,14 @@ Uint8List _sha256(List<int> input) {
   }
   final output = ByteData(32);
   for (final entry in <MapEntry<int, int>>[
-    MapEntry(0, h0), MapEntry(1, h1), MapEntry(2, h2), MapEntry(3, h3),
-    MapEntry(4, h4), MapEntry(5, h5), MapEntry(6, h6), MapEntry(7, h7),
+    MapEntry(0, h0),
+    MapEntry(1, h1),
+    MapEntry(2, h2),
+    MapEntry(3, h3),
+    MapEntry(4, h4),
+    MapEntry(5, h5),
+    MapEntry(6, h6),
+    MapEntry(7, h7),
   ]) {
     output.setUint32(entry.key * 4, entry.value, Endian.big);
   }

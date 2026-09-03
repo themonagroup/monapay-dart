@@ -1,6 +1,24 @@
 # MONA Pay Dart/Flutter SDK
 
-Package Dart không có dependency, dùng `dart:io` `HttpClient` và implementation SHA-256/HMAC thuần Dart. MONA Pay là cổng thanh toán và API ngân hàng của The MONA Group, giúp doanh nghiệp Việt Nam nhận và xác nhận tiền chuyển khoản theo thời gian thực qua tài khoản ảo (VA), VietQR, webhook và Telegram — thiết kế để cả lập trình viên lẫn AI agent tích hợp trong vài phút.
+Package Dart không có dependency, dùng `dart:io` `HttpClient` và implementation SHA-256/HMAC thuần Dart. MONA Pay là cổng thanh toán và API ngân hàng của The MONA Group, giúp doanh nghiệp Việt Nam nhận và xác nhận tiền chuyển khoản theo thời gian thực qua tài khoản ảo (VA), VietQR, webhook và Telegram, thiết kế để cả lập trình viên lẫn AI agent tích hợp trong vài phút.
+
+## Xác thực cho AI agent
+
+```bash
+export MONAPAY_CLIENT_ID="client-id"
+export MONAPAY_CLIENT_SECRET="client-secret"
+export MONAPAY_BASE_URL="https://api.monapay.vn"
+```
+
+```dart
+final client = MonaPayClient.fromEnv();
+final profile = await client.me();
+final qr = await client.qr.generate(qrBody);
+final sandbox = await client.sandbox.createTransaction({'virtual_account_number': 'MONA123', 'amount': 10000, 'description': 'AI test'});
+print(profile);
+```
+
+`MonaPayClient.fromEnv()` ưu tiên client credentials, cache token tới gần hạn và tự lấy lại khi gặp HTTP 401. Username/password chỉ là fallback tương thích cũ, không dùng cho AI agent vì sẽ gãy khi bật 2FA.
 
 ```dart
 final client = MonaPayClient(
@@ -15,7 +33,7 @@ await for (final transaction in client.transactions.iterate(virtualAccountNumber
 }
 ```
 
-Client tự login/cache token, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + stream, retry, webhook configs/test và logs/stats.
+Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + stream/retry, webhook, sandbox, email configs/logs/suppressions.
 
 Xác minh webhook bằng raw bytes trước khi parse:
 

@@ -6,26 +6,37 @@ void expect(bool condition, String message) {
   if (!condition) throw StateError(message);
 }
 
-String envelope(Object? data) => jsonEncode({'success': true, 'message': 'ok', 'data': data});
+String envelope(Object? data) =>
+    jsonEncode({'success': true, 'message': 'ok', 'data': data});
 
 Future<void> main() async {
   final calls = <MonaPayHttpRequest>[];
   var logins = 0;
   var meCalls = 0;
   final client = MonaPayClient(
-    username: 'user',
-    password: 'pass',
+    clientId: 'client-id',
     clientSecret: 'secret',
     baseUrl: 'https://example.test/',
     transport: (request) async {
       calls.add(request);
-      if (request.url.path == '/api/v1/client/login') {
+      if (request.url.path == '/api/v1/oauth/token') {
         logins += 1;
-        return MonaPayHttpResponse(200, envelope({'access_token': 'token-$logins'}));
+        final body = jsonDecode(request.body!) as Map<String, dynamic>;
+        expect(
+          body['grant_type'] == 'client_credentials' &&
+              body['client_id'] == 'client-id' &&
+              body['client_secret'] == 'secret',
+          'OAuth body sai',
+        );
+        return MonaPayHttpResponse(
+          200,
+          envelope({'access_token': 'token-$logins', 'expires_in': 3600}),
+        );
       }
       if (request.url.path == '/api/v1/client/me') {
         meCalls += 1;
-        if (meCalls == 1) return MonaPayHttpResponse(401, jsonEncode({'detail': 'expired'}));
+        if (meCalls == 1)
+          return MonaPayHttpResponse(401, jsonEncode({'detail': 'expired'}));
       }
       return MonaPayHttpResponse(200, envelope({'id': 'ok'}));
     },
@@ -33,10 +44,22 @@ Future<void> main() async {
   await client.webhooks.create({'name': 'Shop'});
   await client.me();
   expect(logins == 2, 'phải login lại đúng một lần sau 401');
-  expect(calls[1].headers['Authorization'] == 'Bearer token-1', 'thiếu bearer token');
-  expect(calls[1].headers['X-Client-Secret'] == 'secret', 'thiếu client secret trên POST');
-  expect(!calls.last.headers.containsKey('X-Client-Secret'), 'GET không được gửi client secret');
-  expect(calls.last.headers['Authorization'] == 'Bearer token-2', 'refresh token không được dùng');
+  expect(
+    calls[1].headers['Authorization'] == 'Bearer token-1',
+    'thiếu bearer token',
+  );
+  expect(
+    calls[1].headers['X-Client-Secret'] == 'secret',
+    'thiếu client secret trên POST',
+  );
+  expect(
+    !calls.last.headers.containsKey('X-Client-Secret'),
+    'GET không được gửi client secret',
+  );
+  expect(
+    calls.last.headers['Authorization'] == 'Bearer token-2',
+    'refresh token không được dùng',
+  );
   client.close();
 
   final pages = <String>[];
@@ -49,7 +72,10 @@ Future<void> main() async {
         return MonaPayHttpResponse(200, envelope({'access_token': 'token'}));
       }
       pages.add(request.url.queryParameters['page']!);
-      expect(!request.url.queryParameters.containsKey('since_id'), 'since_id không phải query backend');
+      expect(
+        !request.url.queryParameters.containsKey('since_id'),
+        'since_id không phải query backend',
+      );
       final items = request.url.queryParameters['page'] == '1'
           ? [
               {'id': 'tx-3'},
@@ -58,14 +84,20 @@ Future<void> main() async {
           : [
               {'id': 'tx-1'},
             ];
-      return MonaPayHttpResponse(200, envelope({'data': items, 'last_page': 2}));
+      return MonaPayHttpResponse(
+        200,
+        envelope({'data': items, 'last_page': 2}),
+      );
     },
   );
   final ids = await paging.transactions
       .iterate(virtualAccountNumber: 'MONA 01', limit: 2, sinceId: 'tx-1')
       .map((item) => item['id'] as String)
       .toList();
-  expect(jsonEncode(ids) == jsonEncode(['tx-3', 'tx-2']), 'iterator/sinceId sai: $ids');
+  expect(
+    jsonEncode(ids) == jsonEncode(['tx-3', 'tx-2']),
+    'iterator/sinceId sai: $ids',
+  );
   expect(jsonEncode(pages) == jsonEncode(['1', '2']), 'phân trang sai: $pages');
   paging.close();
 
@@ -79,8 +111,17 @@ Future<void> main() async {
   );
   expect(webhook.ok, 'vector HMAC-SHA256 không khớp: ${webhook.reason}');
   final zeros = List<String>.filled(64, '0').join();
-  final bad = verifyWebhook(utf8.encode('{}'), '1700000000', 'sha256=$zeros', 'test-secret', tolerance: 10000000000);
-  expect(!bad.ok && bad.reason == 'invalid_signature', 'phải từ chối chữ ký sai');
+  final bad = verifyWebhook(
+    utf8.encode('{}'),
+    '1700000000',
+    'sha256=$zeros',
+    'test-secret',
+    tolerance: 10000000000,
+  );
+  expect(
+    !bad.ok && bad.reason == 'invalid_signature',
+    'phải từ chối chữ ký sai',
+  );
 
   print('MONA Pay Dart self-test: PASS');
 }
