@@ -33,7 +33,19 @@ await for (final transaction in client.transactions.iterate(virtualAccountNumber
 }
 ```
 
-Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + stream/retry, webhook, sandbox, email configs/logs/suppressions.
+Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, payment profile, hosted checkout, bank accounts, VA + hai OTP, QR, transactions + stream/retry, webhook, sandbox, email configs/logs/suppressions.
+
+## Trang thanh toán (hosted checkout)
+
+```dart
+final checkout = await client.checkouts.create({'amount': 250000, 'order_code': 'DH10234', 'return_url': 'https://shop.vn/payment/return'});
+await redirectTo(checkout['checkout_url']);
+if (event['type'] == 'CHECKOUT_PAID') {
+  await fulfillOnce(event['data']['order_code']);
+}
+```
+
+SDK tự sinh `Idempotency-Key` cho `create` và `cancel`; truyền `idempotencyKey` khi anh chị cần dùng key riêng. Nguồn sự thật để giao hàng là webhook `CHECKOUT_PAID` hoặc kết quả `get`, không phải redirect trình duyệt.
 
 Xác minh webhook bằng raw bytes trước khi parse:
 

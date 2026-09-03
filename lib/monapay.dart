@@ -3,9 +3,10 @@ library monapay;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
-const String monaPayVersion = '0.3.0';
+const String monaPayVersion = '0.4.0';
 const String monaPayDefaultBaseUrl = 'https://api.monapay.vn';
 
 class MonaPayException implements Exception {
@@ -84,6 +85,8 @@ class MonaPayClient {
     keys = KeysResource(this);
     va = VirtualAccountsResource(this);
     bankAccounts = BankAccountsResource(this);
+    paymentProfile = PaymentProfileResource(this);
+    checkouts = CheckoutsResource(this);
     qr = QrResource(this);
     transactions = TransactionsResource(this);
     webhooks = WebhooksResource(this);
@@ -128,6 +131,8 @@ class MonaPayClient {
   late final KeysResource keys;
   late final VirtualAccountsResource va;
   late final BankAccountsResource bankAccounts;
+  late final PaymentProfileResource paymentProfile;
+  late final CheckoutsResource checkouts;
   late final QrResource qr;
   late final TransactionsResource transactions;
   late final WebhooksResource webhooks;
@@ -198,10 +203,18 @@ class MonaPayClient {
     String path, {
     Object? body,
     Map<String, String?>? query,
+    Map<String, String>? headers,
   }) async {
     final token = await login();
     try {
-      return await _send(method, path, body: body, query: query, token: token);
+      return await _send(
+        method,
+        path,
+        body: body,
+        query: query,
+        token: token,
+        customHeaders: headers,
+      );
     } on MonaPayException catch (error) {
       if (error.status != 401) rethrow;
       if (_accessToken == token) {
@@ -209,7 +222,14 @@ class MonaPayClient {
         _tokenExpiresAt = DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
       }
       final refreshed = await login();
-      return _send(method, path, body: body, query: query, token: refreshed);
+      return _send(
+        method,
+        path,
+        body: body,
+        query: query,
+        token: refreshed,
+        customHeaders: headers,
+      );
     }
   }
 
@@ -220,6 +240,7 @@ class MonaPayClient {
     Map<String, String?>? query,
     String? token,
     bool authenticated = true,
+    Map<String, String>? customHeaders,
   }) async {
     final cleanQuery = <String, String>{};
     query?.forEach((key, value) {
@@ -236,6 +257,7 @@ class MonaPayClient {
     if (authenticated && method != 'GET' && _clientSecret.isNotEmpty) {
       headers['X-Client-Secret'] = _clientSecret;
     }
+    if (customHeaders != null) headers.addAll(customHeaders);
 
     MonaPayHttpResponse response;
     try {
@@ -330,6 +352,27 @@ class KeysResource extends _Resource {
 
   Future<dynamic> destroy(String keyId) =>
       client.request('DELETE', '/api/v1/client-keys/destroy/${segment(keyId)}');
+
+  Future<dynamic> reveal(
+    String keyId,
+    Map<String, dynamic> confirmation,
+  ) => client.request(
+    'POST',
+    '/api/v1/client-keys/${segment(keyId)}/reveal',
+    body: confirmation,
+  );
+
+  Future<dynamic> rotate(String keyId) async {
+    final data = await client.request(
+      'POST',
+      '/api/v1/client-keys/${segment(keyId)}/rotate',
+      body: const <String, dynamic>{},
+    );
+    if (data is Map && data['client_secret'] != null) {
+      client.useClientSecret(data['client_secret'].toString());
+    }
+    return data;
+  }
 }
 
 class VirtualAccountsResource extends _Resource {
@@ -374,6 +417,85 @@ class BankAccountsResource extends _Resource {
 
   Future<dynamic> list() =>
       client.request('GET', '/api/v1/client/bank-accounts');
+}
+
+class PaymentProfileResource extends _Resource {
+  const PaymentProfileResource(super.client);
+
+  Future<dynamic> get() => client.request('GET', '/api/v1/payment-profile');
+
+  Future<dynamic> set(Map<String, dynamic> body) =>
+      client.request('PUT', '/api/v1/payment-profile', body: body);
+
+  Future<dynamic> rotateReturnSecret() => client.request(
+    'POST',
+    '/api/v1/payment-profile/rotate-return-secret',
+    body: const <String, dynamic>{},
+  );
+
+  Future<dynamic> revealReturnSecret(Map<String, dynamic> confirmation) =>
+      client.request(
+        'POST',
+        '/api/v1/payment-profile/reveal-return-secret',
+        body: confirmation,
+      );
+}
+
+class CheckoutsResource extends _Resource {
+  const CheckoutsResource(super.client);
+
+  Future<dynamic> create(
+    Map<String, dynamic> body, {
+    String? idempotencyKey,
+  }) => client.request(
+    'POST',
+    '/api/v1/checkouts',
+    body: body,
+    headers: {'Idempotency-Key': _idempotencyKey(idempotencyKey)},
+  );
+
+  Future<dynamic> get(String checkoutId) =>
+      client.request('GET', '/api/v1/checkouts/${segment(checkoutId)}');
+
+  Future<dynamic> list({
+    String? status,
+    String? orderCode,
+    String? fromDate,
+    String? toDate,
+    int? page,
+    int? limit,
+  }) => client.request(
+    'GET',
+    '/api/v1/checkouts',
+    query: {
+      'status': status,
+      'order_code': orderCode,
+      'from_date': fromDate,
+      'to_date': toDate,
+      'page': page?.toString(),
+      'limit': limit?.toString(),
+    },
+  );
+
+  Future<dynamic> cancel(
+    String checkoutId, {
+    String? idempotencyKey,
+  }) => client.request(
+    'POST',
+    '/api/v1/checkouts/${segment(checkoutId)}/cancel',
+    body: const <String, dynamic>{},
+    headers: {'Idempotency-Key': _idempotencyKey(idempotencyKey)},
+  );
+}
+
+String _idempotencyKey(String? supplied) {
+  if (supplied != null && supplied.isNotEmpty) return supplied;
+  final random = Random.secure();
+  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
 }
 
 class QrResource extends _Resource {

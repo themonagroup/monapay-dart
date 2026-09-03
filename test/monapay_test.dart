@@ -60,6 +60,18 @@ Future<void> main() async {
     calls.last.headers['Authorization'] == 'Bearer token-2',
     'refresh token không được dùng',
   );
+  await client.checkouts.create(
+    {'amount': 250000},
+    idempotencyKey: 'checkout-key',
+  );
+  expect(
+    calls.last.headers['Idempotency-Key'] == 'checkout-key',
+    'create checkout phải gửi Idempotency-Key',
+  );
+  expect(
+    calls.last.headers['X-Client-Secret'] == 'secret',
+    'create checkout phải gửi X-Client-Secret',
+  );
   client.close();
 
   final pages = <String>[];
